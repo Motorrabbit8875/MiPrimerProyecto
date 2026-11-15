@@ -1,135 +1,124 @@
 from flask import Flask, request, jsonify
 from collections import deque
+import numpy as np
 
 app = Flask(__name__)
 
-# Límites clínicos (I) y umbral de salto brusco (40% de la amplitud del rango normal)
-CONFIG_IMR = {
-    "bpm": {"min": 70, "max": 90, "mr_max": 15},          # Ejemplo: 70 -> 85 (salto de 15)
-    "spo2": {"min": 95, "max": 100, "mr_max": 2},         # 40% de 5% = 2% de salto
-    "temperature": {"min": 36.1, "max": 37.2, "mr_max": 0.4} # Ejemplo: 36.3 -> 36.7 (salto de 0.4)
+# Tamaño de la ventana deslizante (búfer circular en RAM por variable)
+VENTANA_MUESTRAS = 15
+
+# Rangos clínicos estándares (mínimo, máximo) y umbral máximo de dispersión (desviación estándar)
+PARAMETROS_ESTANDAR = {
+    "bpm": {"min": 70.0, "max": 90.0, "std_max": 8.0},
+    "spo2": {"min": 95.0, "max": 100.0, "std_max": 1.5},
+    "temperature": {"min": 36.1, "max": 37.2, "std_max": 0.35}
 }
 
-# Memoria por astronauta: guarda historial y estado de bloqueo por variación brusca
-estado_entes = {}
+# Búfer circular en RAM indexado por astronauta
+buffer_telemetria = {}
 
-def inicializar_ente(astro):
-    if astro not in estado_entes:
-        estado_entes[astro] = {
-            "bloqueado": False,
-            "mensaje_bloqueo": "",
-            "historial": {
-                "bpm": deque(maxlen=6),
-                "spo2": deque(maxlen=6),
-                "temperature": deque(maxlen=6)
-            }
+def obtener_buffer_astro(astro):
+    """Inicializa o recupera las ventanas deslizantes en RAM para un astronauta."""
+    if astro not in buffer_telemetria:
+        buffer_telemetria[astro] = {
+            "bpm": deque(maxlen=VENTANA_MUESTRAS),
+            "spo2": deque(maxlen=VENTANA_MUESTRAS),
+            "temperature": deque(maxlen=VENTANA_MUESTRAS),
+            "actividad": deque(maxlen=VENTANA_MUESTRAS)
         }
+    return buffer_telemetria[astro]
 
-def detectar_tendencia(valores):
-    if len(valores) < 6:
-        return False
-    lista = list(valores)
-    return all(lista[i] < lista[i + 1] for i in range(5)) or all(lista[i] > lista[i + 1] for i in range(5))
-
-def evaluar_imr(astro, variable, valor_actual):
-    cfg = CONFIG_IMR[variable]
-    ventana = estado_entes[astro]["historial"][variable]
+def procesar_variable_numpy(ventana, valor_actual, reglas):
+    """Inserta la muestra en el deque y calcula media y desviación estándar con NumPy."""
+    ventana.append(float(valor_actual))
     
-    mr = abs(valor_actual - ventana[-1]) if len(ventana) > 0 else 0
-    ventana.append(valor_actual)
+    arr = np.array(ventana, dtype=np.float64)
+    media = float(np.round(np.mean(arr), 2))
+    desv_std = float(np.round(np.std(arr), 2))
     
-    # 1. Nivel 3: Peligro Crítico (Fuera de rango estándar)
-    if valor_actual < cfg["min"] or valor_actual > cfg["max"]:
-        return {"estado": "Peligro", "valor": valor_actual, "brusco": False}
-    
-    # 2. Nivel 1: Salto Brusco (Detona bloqueo de operador)
-    if mr >= cfg["mr_max"]:
-        return {"estado": "Alerta Brusca", "valor": valor_actual, "brusco": True}
-    
-    # 3. Nivel 2: Tendencia Progresiva (6 lecturas consecutivas)
-    if detectar_tendencia(ventana):
-        return {"estado": "Alerta Tendencia", "valor": valor_actual, "brusco": False}
-    
-    return {"estado": "Normal", "valor": valor_actual, "brusco": False}
+    # 1. Evaluación contra límites clínicos estándares
+    if valor_actual < reglas["min"] or valor_actual > reglas["max"]:
+        estado = "PELIGRO"
+    # 2. Evaluación de inestabilidad estadística (cuando hay al menos 3 muestras)
+    elif len(arr) >= 3 and desv_std > reglas["std_max"]:
+        estado = "ALERTA"
+    else:
+        estado = "ESTABLE"
+        
+    return {
+        "valor": valor_actual,
+        "media": media,
+        "std": desv_std,
+        "estado": estado
+    }
 
 @app.route('/telemetria', methods=['POST'])
-def recibir_y_validar():
+def recibir_telemetria():
+    # 1. Deserialización segura (nunca lanza excepción ante tramas vacías o corruptas)
     datos = request.get_json(silent=True)
     if not isinstance(datos, dict):
-        return jsonify({"error": "El formato debe ser un objeto JSON válido"}), 400
+        return jsonify({"status": "ERROR", "detalle": "Payload JSON inválido o vacío"}), 400
 
-    astro = datos.get("astro", "Astro 1")
-    inicializar_ente(astro)
-    ente = estado_entes[astro]
-
-    # --- PASO A: VERIFICAR SI EL OPERADOR ENVIÓ "ok" DESDE LA ESP32 ---
-    comando = str(datos.get("comando", "")).strip().lower()
-    if comando == "ok":
-        ente["bloqueado"] = False
-        ente["mensaje_bloqueo"] = ""
-        # Limpiamos el historial anterior para que el nuevo valor no dispare otro salto falso
-        for var in ente["historial"]:
-            ente["historial"][var].clear()
-        
-        print(f"✅ [{astro}] OPERADOR CONFIRMÓ 'OK'. Sistema desbloqueado y reanudando lecturas.")
-        return jsonify({
-            "astro": astro,
-            "estado": "REANUDADO",
-            "mensaje": "Operador verificado. Reanudando toma de valores."
-        }), 200
-
-    # --- PASO B: SI ESTÁ BLOQUEADO POR VARIACIÓN BRUSCA, IGNORAR LECTURAS Y MANTENER AVISO ---
-    if ente["bloqueado"]:
-        print(f"🔒 [{astro}] BLOQUEADO - Esperando 'ok' del operador...")
-        return jsonify({
-            "astro": astro,
-            "estado": "BLOQUEADO",
-            "mensaje": "Alerta variacion brusca, favor de revisar operador"
-        }), 200
-
-    # --- PASO C: VALIDAR TIPOS DE DATOS DE LOS SENSORES ---
-    campos_esperados = {
+    # 2. Validación estricta de llaves y tipos de datos
+    esquema_obligatorio = {
+        "astro": (str,),
         "bpm": (int, float),
         "spo2": (int, float),
-        "temperature": (int, float)
+        "temperature": (int, float),
+        "actividad": (int,)
     }
 
-    for campo, tipos_validos in campos_esperados.items():
-        if campo not in datos:
-            return jsonify({"error": f"Falta el campo obligatorio: '{campo}'"}), 400
-        if isinstance(datos[campo], bool) or not isinstance(datos[campo], tipos_validos):
-            return jsonify({"error": f"El campo '{campo}' tiene un tipo de dato inválido"}), 400
+    for llave, tipos_validos in esquema_obligatorio.items():
+        if llave not in datos:
+            return jsonify({"status": "ERROR", "detalle": f"Falta campo obligatorio: {llave}"}), 400
+        valor = datos[llave]
+        if isinstance(valor, bool) or not isinstance(valor, tipos_validos):
+            return jsonify({"status": "ERROR", "detalle": f"Tipo inválido en '{llave}'"}), 400
 
-    hr = datos["bpm"]
-    spo2 = datos["spo2"]
-    temperature = datos["temperature"]
+    astro = datos["astro"].strip() or "Astro_Desconocido"
+    buffers = obtener_buffer_astro(astro)
 
-    # --- PASO D: EVALUAR MÉTODO I-MR ---
-    res_bpm = evaluar_imr(astro, "bpm", hr)
-    res_spo2 = evaluar_imr(astro, "spo2", spo2)
-    res_temp = evaluar_imr(astro, "temperature", temperature)
+    # 3. Inserción en búfer circular y cálculo estadístico móvil con NumPy
+    res_bpm = procesar_variable_numpy(buffers["bpm"], datos["bpm"], PARAMETROS_ESTANDAR["bpm"])
+    res_spo2 = procesar_variable_numpy(buffers["spo2"], datos["spo2"], PARAMETROS_ESTANDAR["spo2"])
+    res_temp = procesar_variable_numpy(buffers["temperature"], datos["temperature"], PARAMETROS_ESTANDAR["temperature"])
+    buffers["actividad"].append(datos["actividad"])
 
-    # Revisar si CUALQUIERA de las 3 variables tuvo un cambio brusco
-    if res_bpm["brusco"] or res_spo2["brusco"] or res_temp["brusco"]:
-        ente["bloqueado"] = True
-        aviso = "Alerta variacion brusca, favor de revisar operador"
-        print(f"🚨 [{astro}] {aviso} -> BPM:{hr} | SpO2:{spo2} | Temp:{temperature}")
-        return jsonify({
-            "astro": astro,
-            "estado": "BLOQUEADO",
-            "mensaje": aviso
-        }), 200
+    # 4. Consolidar estado global del traje (prioridad: PELIGRO > ALERTA > ESTABLE)
+    estados_individuales = [res_bpm["estado"], res_spo2["estado"], res_temp["estado"]]
+    if "PELIGRO" in estados_individuales:
+        estado_global = "PELIGRO"
+        activar_alerta_fisica = True
+    elif "ALERTA" in estados_individuales:
+        estado_global = "ALERTA"
+        activar_alerta_fisica = True
+    else:
+        estado_global = "ESTABLE"
+        activar_alerta_fisica = False
 
-    # Si no hubo salto brusco, devolver estado normal / tendencia / peligro
-    respuesta = {
+    # Log limpio en consola del Maestro
+    print(
+        f"[{astro} | Act:{datos['actividad']}] {estado_global} -> "
+        f"BPM:{res_bpm['valor']} (μ:{res_bpm['media']}, σ:{res_bpm['std']}) | "
+        f"SpO2:{res_spo2['valor']} (μ:{res_spo2['media']}, σ:{res_spo2['std']}) | "
+        f"Temp:{res_temp['valor']} (μ:{res_temp['media']}, σ:{res_temp['std']})"
+    )
+
+    # 5. Respuesta JSON ligera y síncrona (200 OK) para el ESP32
+    respuesta_esp = {
+        "status": "OK",
         "astro": astro,
-        "BPM": {"estado": res_bpm["estado"], "valor": res_bpm["valor"]},
-        "SPO2": {"estado": res_spo2["estado"], "valor": res_spo2["valor"]},
-        "Temperatura": {"estado": res_temp["estado"], "valor": res_temp["valor"]}
+        "estado_global": estado_global,
+        "alerta_fisica": activar_alerta_fisica,
+        "analisis": {
+            "bpm": res_bpm,
+            "spo2": res_spo2,
+            "temperature": res_temp
+        }
     }
 
-    print(f"[{astro}] BPM: {res_bpm['estado']} ({hr}) | SPO2: {res_spo2['estado']} ({spo2}) | Temp: {res_temp['estado']} ({temperature})")
-    return jsonify(respuesta), 200
+    return jsonify(respuesta_esp), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    print("🚀 Nodo Maestro Edge activo en 0.0.0.0:5000 (Red Local 2.4 GHz)")
+    app.run(host='0.0.0.0', port=5000, threaded=True)
